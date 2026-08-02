@@ -1,4 +1,4 @@
-# downloader.py - High-Performance Anti-Ban Parallel MTProto Downloader
+# downloader.py - High-Performance Anti-Ban Parallel MTProto Downloader with tqdm Progress Bars
 
 import os
 import sys
@@ -15,6 +15,13 @@ except ImportError:
     from telethon import TelegramClient, errors
     from telethon.tl.types import MessageMediaDocument, MessageMediaPhoto, DocumentAttributeFilename
 
+try:
+    from tqdm import tqdm
+except ImportError:
+    print("[Dependency] Installing tqdm for multi-bar progress display...")
+    os.system("pip install tqdm")
+    from tqdm import tqdm
+
 from config import (
     API_ID, API_HASH, TARGET_CHANNEL_ID,
     DOWNLOAD_ROOT, SESSION_FILE, MANIFEST_FILE,
@@ -23,6 +30,9 @@ from config import (
 
 # Concurrency Semaphore bounded to safe non-bannable threshold (3 concurrent workers)
 semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
+worker_slots = asyncio.Queue()
+for i in range(1, MAX_CONCURRENT_DOWNLOADS + 1):
+    worker_slots.put_nowait(i)
 
 manifest = {}
 if MANIFEST_FILE.exists():
@@ -42,15 +52,34 @@ async def save_manifest_async():
             print(f"[Error saving manifest]: {e}")
     await asyncio.to_thread(_write)
 
-async def download_worker(client, message, target_file, clean_filename, current_section, msg_id):
-    """Parallel download worker task with rate-limit protection."""
+async def download_worker(client, message, target_file, clean_filename, current_section, msg_id, overall_pbar):
+    """Parallel download worker task with individual tqdm progress bar per file."""
     async with semaphore:
-        print(f"[Starting Download] {clean_filename} -> Subfolder: [{current_section}]")
+        slot_id = await worker_slots.get()
         
+        # Trim filename for clean console progress display
+        disp_name = clean_filename if len(clean_filename) <= 32 else (clean_filename[:29] + "...")
+        
+        pbar = tqdm(
+            total=0,
+            unit='B',
+            unit_scale=True,
+            unit_divisor=1024,
+            desc=f"Worker {slot_id} | {disp_name}",
+            position=slot_id,
+            leave=False
+        )
+
+        def progress_callback(current, total):
+            if total > 0 and pbar.total != total:
+                pbar.reset(total=total)
+            pbar.update(current - pbar.n)
+
+        success = False
         for attempt in range(1, RETRY_ATTEMPTS + 1):
             try:
-                # Direct Telethon MTProto media stream (3 workers downloading in parallel)
-                await client.download_media(message, file=str(target_file))
+                # Telethon MTProto stream with live progress callback
+                await client.download_media(message, file=str(target_file), progress_callback=progress_callback)
 
                 # Record completion atomically
                 manifest[msg_id] = {
@@ -61,17 +90,23 @@ async def download_worker(client, message, target_file, clean_filename, current_
                     "size_bytes": target_file.stat().st_size if target_file.exists() else 0
                 }
                 await save_manifest_async()
-                print(f"[Success ✅] {clean_filename} saved.")
-                return True
+                success = True
+                break
 
             except errors.FloodWaitError as e:
-                print(f"\n[Rate Limit Pause] Telegram requested a pause. Sleeping for {e.seconds + 2} seconds...")
+                pbar.set_description(f"Worker {slot_id} | Paused {e.seconds}s (RateLimit)")
                 await asyncio.sleep(e.seconds + 2)
             except Exception as e:
-                print(f"\n[Error Attempt {attempt}/{RETRY_ATTEMPTS}] Failed Msg {message.id} ({clean_filename}): {e}")
+                pbar.set_description(f"Worker {slot_id} | Retry {attempt}/{RETRY_ATTEMPTS}")
                 await asyncio.sleep(2)
+
+        pbar.close()
+        worker_slots.put_nowait(slot_id)
         
-        return False
+        if overall_pbar:
+            overall_pbar.update(1)
+            
+        return success
 
 async def run_telethon_downloader():
     print("==================================================================")
@@ -112,9 +147,9 @@ async def run_telethon_downloader():
     current_section = "00_General_Files"
     total_found = 0
     total_skipped = 0
-    download_tasks = []
+    pending_tasks_data = []
 
-    print("\nScanning message history and dispatching parallel tasks...\n")
+    print("\nScanning message history and cataloging media items...\n")
 
     async for message in client.iter_messages(entity, reverse=True):
         text = message.text or ""
@@ -155,22 +190,38 @@ async def run_telethon_downloader():
                     total_skipped += 1
                     continue
 
-            # Queue task into bounded async worker pool
-            task = asyncio.create_task(
-                download_worker(client, message, target_file, clean_filename, current_section, msg_id)
-            )
-            download_tasks.append(task)
-            
-            # Stagger dispatch slightly to prevent burst connection spikes
-            await asyncio.sleep(WORKER_JITTER_DELAY_SEC)
+            pending_tasks_data.append((message, target_file, clean_filename, current_section, msg_id))
 
-    print(f"\n[Queue Manager] Dispatched {len(download_tasks)} download tasks. Processing parallel pool...\n")
+    print(f"\nCatalog Summary:")
+    print(f"   Total Media Found:   {total_found}")
+    print(f"   Already Saved (D:):  {total_skipped}")
+    print(f"   Pending Downloads:   {len(pending_tasks_data)}\n")
 
-    if download_tasks:
-        results = await asyncio.gather(*download_tasks)
-        total_downloaded = sum(1 for r in results if r is True)
-    else:
-        total_downloaded = 0
+    if not pending_tasks_data:
+        print("🎉 All channel media files are already downloaded and synchronized on Drive D:!")
+        return
+
+    # Create Overall Channel Progress Bar
+    overall_pbar = tqdm(
+        total=len(pending_tasks_data),
+        desc="Overall Channel Progress",
+        unit="file",
+        position=0,
+        leave=True
+    )
+
+    download_tasks = []
+    for message, target_file, clean_filename, sec, msg_id in pending_tasks_data:
+        task = asyncio.create_task(
+            download_worker(client, message, target_file, clean_filename, sec, msg_id, overall_pbar)
+        )
+        download_tasks.append(task)
+        await asyncio.sleep(WORKER_JITTER_DELAY_SEC)
+
+    results = await asyncio.gather(*download_tasks)
+    overall_pbar.close()
+
+    total_downloaded = sum(1 for r in results if r is True)
 
     print("\n==================================================================")
     print("ALL FILES BATCH DOWNLOAD COMPLETE!")
