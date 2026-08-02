@@ -18,12 +18,14 @@ try:
     from rich.progress import Progress, TextColumn, BarColumn, DownloadColumn, TransferSpeedColumn, TimeRemainingColumn
     from rich.console import Console
     from rich.panel import Panel
+    from rich.text import Text
 except ImportError:
     print("[Dependency] Installing rich for advanced UI...")
     os.system("pip install rich")
     from rich.progress import Progress, TextColumn, BarColumn, DownloadColumn, TransferSpeedColumn, TimeRemainingColumn
     from rich.console import Console
     from rich.panel import Panel
+    from rich.text import Text
 
 from config import (
     API_ID, API_HASH, TARGET_CHANNEL_ID,
@@ -58,25 +60,46 @@ async def save_manifest_async(progress_context=None):
                 progress_context.console.print(f"[red][Error saving manifest]: {e}[/red]")
     await asyncio.to_thread(_write)
 
+
+# --- SMART UI COLUMNS ---
+# These columns reveal speed/MBs for file tasks, but hide for the Overall Bar
+class SmartDownloadColumn(DownloadColumn):
+    def render(self, task):
+        if task.fields.get("is_overall"):
+            return Text("")
+        return Text(" \u2022 ") + super().render(task)
+
+class SmartTransferSpeedColumn(TransferSpeedColumn):
+    def render(self, task):
+        if task.fields.get("is_overall"):
+            return Text("")
+        return Text(" \u2022 ") + super().render(task)
+
+class SmartTimeRemainingColumn(TimeRemainingColumn):
+    def render(self, task):
+        if task.fields.get("is_overall"):
+            return Text("")
+        return Text(" \u2022 ") + super().render(task)
+# ------------------------
+
+
 async def download_worker(client, message, target_file, clean_filename, current_section, msg_id, progress, overall_task_id):
     """Parallel download worker using Rich progress bars."""
     async with semaphore:
         slot_id = await worker_slots.get()
 
-        # Display: show msg ID + truncated name for unique identification
-        short_name = clean_filename.split("_", 1)[-1] if "_" in clean_filename else clean_filename
-        disp_tag = f"#{msg_id}"
-        max_name_len = 20 - len(disp_tag) - 1  # leave room for ID + space
-        if len(short_name) > max_name_len:
-            disp_name = f"{disp_tag} {short_name[:max_name_len - 3]}..."
+        # Format display name: 25 chars max, padded to prevent jitter
+        if len(clean_filename) > 25:
+            disp_name = clean_filename[:22] + "..."
         else:
-            disp_name = f"{disp_tag} {short_name:<{max_name_len}}"
+            disp_name = f"{clean_filename:<25}"
 
         file_size = getattr(message, "file", None).size if getattr(message, "file", None) else 0
         if not file_size and hasattr(message.media, "document"):
             file_size = getattr(message.media.document, "size", 0)
 
-        task_id = progress.add_task("download", filename=disp_name, total=file_size if file_size > 0 else None, custom_stats="")
+        # is_overall=False so Smart Columns render speed data for this task
+        task_id = progress.add_task("download", filename=disp_name, total=file_size if file_size > 0 else None, custom_stats="", is_overall=False)
 
         def progress_callback(current, total):
             if total > 0:
@@ -109,13 +132,13 @@ async def download_worker(client, message, target_file, clean_filename, current_
                     break
 
             except errors.FloodWaitError as e:
-                progress.update(task_id, filename=f"[yellow]{'Paused (RateLimit)':<20}[/yellow]")
+                progress.update(task_id, filename=f"[yellow]{'Paused (RateLimit)':<25}[/yellow]")
                 await asyncio.sleep(e.seconds + 2)
                 progress.update(task_id, filename=disp_name)
             except Exception as e:
                 # SAFE PRINT: Does not corrupt the progress buffer
                 progress.console.print(f"[red]Worker {slot_id} Error on {disp_name.strip()}: {e}[/red]")
-                progress.update(task_id, filename=f"[red]{f'Retry {attempt}/{RETRY_ATTEMPTS}':<20}[/red]")
+                progress.update(task_id, filename=f"[red]{f'Retry {attempt}/{RETRY_ATTEMPTS}':<25}[/red]")
                 await asyncio.sleep(2)
                 progress.update(task_id, filename=disp_name)
 
@@ -129,15 +152,15 @@ async def download_worker(client, message, target_file, clean_filename, current_
         return success
 
 async def run_telethon_downloader():
-    # \U0001f680 Funky Neon Startup Banner
+    # Funky Neon Startup Banner
     banner_text = (
         f"[bold #00FFFF]\U0001f4c2 Output Directory:[/bold #00FFFF]     [italic #FFFFFF]{DOWNLOAD_ROOT}[/]\n"
         f"[bold #FF00FF]\u26a1 Max Concurrent Files:[/bold #FF00FF] [#00FF00]{MAX_CONCURRENT_DOWNLOADS}[/]\n"
         f"[bold #FFA500]\U0001f525 Large File Threshold:[/bold #FFA500] [#00FF00]{LARGE_FILE_THRESHOLD_MB} MB[/] [italic](Parallel Chunking Active)[/]"
     )
     console.print(Panel(
-        banner_text, 
-        title="[bold blink #39FF14]\U0001f47e TELEGRAM MTPROTO DOWNLOADER \U0001f47e[/]", 
+        banner_text,
+        title="[bold blink #39FF14]\U0001f47e TELEGRAM MTPROTO DOWNLOADER \U0001f47e[/]",
         border_style="#FF00FF",
         expand=False
     ))
@@ -204,9 +227,12 @@ async def run_telethon_downloader():
             elif isinstance(message.media, MessageMediaPhoto):
                 filename = f"photo_{message.id}.jpg"
 
-            # Sanitize then prepend message ID to guarantee unique filenames across the channel
             clean_base = "".join([c if c.isalnum() or c in " ._-" else "_" for c in filename])
-            clean_filename = f"{message.id}_{clean_base}"
+
+            # UNIQUE ID INJECTION: name_{msgid}.ext prevents concurrent .tmp file crashes
+            name_part, ext_part = os.path.splitext(clean_base)
+            clean_filename = f"{name_part}_{msg_id}{ext_part}"
+
             target_file = target_folder / clean_filename
 
             expected_size = getattr(message, "file", None).size if getattr(message, "file", None) else 0
@@ -238,37 +264,38 @@ async def run_telethon_downloader():
         console.print("[bold green]All channel media files are already downloaded and synchronized on Drive D:![/bold green]")
         return
 
-    # \U0001f308 Glitch-Proof Progress Bar Layout
+    # Smart Glitch-Proof UI Layout
     with Progress(
         TextColumn("[bold #FFD700]{task.fields[filename]}", justify="left"),
         BarColumn(
-            bar_width=30,  # Hardcoded width prevents terminal-resizing from breaking layout
+            bar_width=30,
             style="color(237)",
             complete_style="#00FF00",
             finished_style="#FF00FF"
         ),
         "[progress.percentage][bold #00FFFF]{task.percentage:>3.1f}%[/]",
-        "\u2022",
         TextColumn("{task.fields[custom_stats]}", justify="left"),
+        SmartDownloadColumn(),       # Only renders for file tasks
+        SmartTransferSpeedColumn(),  # Only renders for file tasks
+        SmartTimeRemainingColumn(),  # Only renders for file tasks
         console=console,
-        expand=False  # Prevents stretching and wrapping
+        expand=False
     ) as progress:
 
-        # Overall task uses custom_stats to format items as Files, not bytes
+        # is_overall=True hides Download, Speed, Time columns for this bar
         overall_task_id = progress.add_task(
             "overall",
-            filename="[bold #39FF14]\U0001f680 OVERALL PROGRESS  ",
+            filename="[bold #39FF14]\U0001f680 OVERALL PROGRESS    ",
             total=len(pending_tasks_data),
-            custom_stats=f"[#39FF14]0/{len(pending_tasks_data)} Files[/]"
+            custom_stats=f" \u2022 [#39FF14]0/{len(pending_tasks_data)} Files[/]",
+            is_overall=True
         )
 
-        # Wrapped worker updates overall counter with correct "X/Y Files" text
         async def wrapped_worker(msg, t_file, c_file, sec, m_id):
-            res = await download_worker(client, msg, t_file, c_file, sec, m_id, progress, None)
+            res = await download_worker(client, msg, t_file, c_file, sec, m_id, progress, overall_task_id)
             if res:
-                progress.update(overall_task_id, advance=1)
                 completed = progress.tasks[overall_task_id].completed
-                progress.update(overall_task_id, custom_stats=f"[#39FF14]{int(completed)}/{len(pending_tasks_data)} Files[/]")
+                progress.update(overall_task_id, custom_stats=f" \u2022 [#39FF14]{int(completed)}/{len(pending_tasks_data)} Files[/]")
             return res
 
         download_tasks = [
@@ -281,8 +308,8 @@ async def run_telethon_downloader():
         results = await asyncio.gather(*download_tasks)
 
     total_downloaded = sum(1 for r in results if r is True)
-    
-    # \U0001f389 Funky Completion Summary
+
+    # Funky Completion Summary
     summary_text = (
         f"[bold #00FFFF]Total Files Found:[/bold #00FFFF]       {total_found}\n"
         f"[bold #FFA500]Skipped (Already on D:):[/bold #FFA500] {total_skipped}\n"
@@ -291,8 +318,8 @@ async def run_telethon_downloader():
     )
     console.print("\n")
     console.print(Panel(
-        summary_text, 
-        title="[bold #39FF14]\U0001f389 BATCH DOWNLOAD COMPLETE! \U0001f389[/]", 
+        summary_text,
+        title="[bold #39FF14]\U0001f389 BATCH DOWNLOAD COMPLETE! \U0001f389[/]",
         border_style="#00FFFF",
         expand=False
     ))
