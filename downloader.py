@@ -18,10 +18,8 @@ except ImportError:
 from config import (
     API_ID, API_HASH, TARGET_CHANNEL_ID,
     DOWNLOAD_ROOT, SESSION_FILE, MANIFEST_FILE,
-    MAX_CONCURRENT_DOWNLOADS, LARGE_FILE_THRESHOLD_MB,
-    WORKER_JITTER_DELAY_SEC, RETRY_ATTEMPTS
+    MAX_CONCURRENT_DOWNLOADS, WORKER_JITTER_DELAY_SEC, RETRY_ATTEMPTS
 )
-from fast_telethon import download_file_parallel
 
 # Concurrency Semaphore bounded to safe non-bannable threshold (3 concurrent workers)
 semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
@@ -45,22 +43,14 @@ async def save_manifest_async():
     await asyncio.to_thread(_write)
 
 async def download_worker(client, message, target_file, clean_filename, current_section, msg_id):
-    """Parallel download worker task with rate-limit protection and FastTelethon integration."""
+    """Parallel download worker task with rate-limit protection."""
     async with semaphore:
         print(f"[Starting Download] {clean_filename} -> Subfolder: [{current_section}]")
         
         for attempt in range(1, RETRY_ATTEMPTS + 1):
             try:
-                doc = getattr(message.media, "document", None)
-                file_size_mb = (doc.size / (1024 * 1024)) if doc and hasattr(doc, "size") else 0
-
-                # FastTelethon parallel chunk streaming for large files (>20MB)
-                if doc and file_size_mb >= LARGE_FILE_THRESHOLD_MB:
-                    print(f"   [FastTelethon Mode: {round(file_size_mb, 1)} MB] Parallel chunking for {clean_filename}...")
-                    location = message.media
-                    await download_file_parallel(client, location, target_file, doc.size)
-                else:
-                    await client.download_media(message, file=str(target_file))
+                # Direct Telethon MTProto media stream (3 workers downloading in parallel)
+                await client.download_media(message, file=str(target_file))
 
                 # Record completion atomically
                 manifest[msg_id] = {
@@ -87,9 +77,8 @@ async def run_telethon_downloader():
     print("==================================================================")
     print("TELEGRAM PARALLEL MTPROTO DOWNLOADER (ANTI-BAN SAFE, DRIVE D:)")
     print("==================================================================")
-    print(f"Output Directory:        {DOWNLOAD_ROOT}")
-    print(f"Max Parallel Workers:    {MAX_CONCURRENT_DOWNLOADS} (Rate-limit Safe)")
-    print(f"FastTelethon Threshold:  {LARGE_FILE_THRESHOLD_MB} MB")
+    print(f"Output Directory:     {DOWNLOAD_ROOT}")
+    print(f"Max Parallel Workers: {MAX_CONCURRENT_DOWNLOADS} (Rate-limit Safe)")
     print("==================================================================\n")
 
     client = TelegramClient(
