@@ -1,4 +1,4 @@
-# downloader.py - High-Performance Telethon MTProto Channel Downloader
+# downloader.py - High-Performance Anti-Ban Parallel MTProto Downloader
 
 import os
 import sys
@@ -7,18 +7,24 @@ import asyncio
 from pathlib import Path
 
 try:
-    from telethon import TelegramClient
+    from telethon import TelegramClient, errors
     from telethon.tl.types import MessageMediaDocument, MessageMediaPhoto, DocumentAttributeFilename
 except ImportError:
     print("[Dependency] Installing telethon...")
     os.system("pip install telethon")
-    from telethon import TelegramClient
+    from telethon import TelegramClient, errors
     from telethon.tl.types import MessageMediaDocument, MessageMediaPhoto, DocumentAttributeFilename
 
 from config import (
     API_ID, API_HASH, TARGET_CHANNEL_ID,
-    DOWNLOAD_ROOT, SESSION_FILE, MANIFEST_FILE
+    DOWNLOAD_ROOT, SESSION_FILE, MANIFEST_FILE,
+    MAX_CONCURRENT_DOWNLOADS, LARGE_FILE_THRESHOLD_MB,
+    WORKER_JITTER_DELAY_SEC, RETRY_ATTEMPTS
 )
+from fast_telethon import download_file_parallel
+
+# Concurrency Semaphore bounded to safe non-bannable threshold (3 concurrent workers)
+semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 
 manifest = {}
 if MANIFEST_FILE.exists():
@@ -28,42 +34,75 @@ if MANIFEST_FILE.exists():
     except Exception:
         manifest = {}
 
-def save_manifest():
-    try:
-        with open(MANIFEST_FILE, "w", encoding="utf-8") as f:
-            json.dump(manifest, f, indent=2)
-    except Exception as e:
-        print(f"[Error saving manifest]: {e}")
+# Asynchronous non-blocking manifest writer
+async def save_manifest_async():
+    def _write():
+        try:
+            with open(MANIFEST_FILE, "w", encoding="utf-8") as f:
+                json.dump(manifest, f, indent=2)
+        except Exception as e:
+            print(f"[Error saving manifest]: {e}")
+    await asyncio.to_thread(_write)
 
-def progress_callback(current, total):
-    pct = round((current / total) * 100) if total > 0 else 0
-    curr_mb = round(current / (1024 * 1024), 2)
-    tot_mb = round(total / (1024 * 1024), 2)
-    sys.stdout.write(f"\r   Downloading: [{pct:3d}%] {curr_mb} MB / {tot_mb} MB")
-    sys.stdout.flush()
+async def download_worker(client, message, target_file, clean_filename, current_section, msg_id):
+    """Parallel download worker task with rate-limit protection and FastTelethon integration."""
+    async with semaphore:
+        print(f"[Starting Download] {clean_filename} -> Subfolder: [{current_section}]")
+        
+        for attempt in range(1, RETRY_ATTEMPTS + 1):
+            try:
+                doc = getattr(message.media, "document", None)
+                file_size_mb = (doc.size / (1024 * 1024)) if doc and hasattr(doc, "size") else 0
+
+                # FastTelethon parallel chunk streaming for large files (>20MB)
+                if doc and file_size_mb >= LARGE_FILE_THRESHOLD_MB:
+                    print(f"   [FastTelethon Mode: {round(file_size_mb, 1)} MB] Parallel chunking for {clean_filename}...")
+                    location = message.media
+                    await download_file_parallel(client, location, target_file, doc.size)
+                else:
+                    await client.download_media(message, file=str(target_file))
+
+                # Record completion atomically
+                manifest[msg_id] = {
+                    "status": "complete",
+                    "path": str(target_file),
+                    "filename": clean_filename,
+                    "section": current_section,
+                    "size_bytes": target_file.stat().st_size if target_file.exists() else 0
+                }
+                await save_manifest_async()
+                print(f"[Success ✅] {clean_filename} saved.")
+                return True
+
+            except errors.FloodWaitError as e:
+                print(f"\n[Rate Limit Pause] Telegram requested a pause. Sleeping for {e.seconds + 2} seconds...")
+                await asyncio.sleep(e.seconds + 2)
+            except Exception as e:
+                print(f"\n[Error Attempt {attempt}/{RETRY_ATTEMPTS}] Failed Msg {message.id} ({clean_filename}): {e}")
+                await asyncio.sleep(2)
+        
+        return False
 
 async def run_telethon_downloader():
     print("==================================================================")
-    print("TELEGRAM NATIVE MTPROTO ALL-FILES DOWNLOADER (DRIVE D: ISOLATED)")
+    print("TELEGRAM PARALLEL MTPROTO DOWNLOADER (ANTI-BAN SAFE, DRIVE D:)")
     print("==================================================================")
-    print(f"Output Folder:    {DOWNLOAD_ROOT}")
-    print(f"Target Channel:   {TARGET_CHANNEL_ID}")
-    print(f"API ID:           {API_ID}")
+    print(f"Output Directory:        {DOWNLOAD_ROOT}")
+    print(f"Max Parallel Workers:    {MAX_CONCURRENT_DOWNLOADS} (Rate-limit Safe)")
+    print(f"FastTelethon Threshold:  {LARGE_FILE_THRESHOLD_MB} MB")
     print("==================================================================\n")
 
     client = TelegramClient(
         str(SESSION_FILE),
         API_ID,
         API_HASH,
-        device_model="Desktop",
+        device_model="Desktop Parallel Node",
         system_version="Windows 11",
         app_version="4.16.30"
     )
     
     await client.start()
-
-    print("\nAuthenticated with Telegram MTProto API successfully!")
-    print("Resolving channel metadata...")
+    print("Authenticated with Telegram MTProto API successfully!")
 
     entity = None
     try:
@@ -83,10 +122,10 @@ async def run_telethon_downloader():
 
     current_section = "00_General_Files"
     total_found = 0
-    total_downloaded = 0
     total_skipped = 0
+    download_tasks = []
 
-    print("\nScanning message history from oldest to newest (ALL files & media)...\n")
+    print("\nScanning message history and dispatching parallel tasks...\n")
 
     async for message in client.iter_messages(entity, reverse=True):
         text = message.text or ""
@@ -95,7 +134,6 @@ async def run_telethon_downloader():
         if text and len(text) < 120 and any(kw in text.lower() for kw in ["module", "day", "chapter", "section", "#", "part", "lecture", "assignment"]):
             clean_heading = "".join([c if c.isalnum() or c in " _-" else "_" for c in text.strip()])
             current_section = clean_heading[:60].strip()
-            print(f"\nSECTION: {current_section}")
 
         # Process ALL media items (Videos, Documents, Zip, PDF, Code, Photos, Audio)
         if message.media:
@@ -123,35 +161,32 @@ async def run_telethon_downloader():
             target_file = target_folder / clean_filename
 
             # Resumability check
-            if target_file.exists():
-                file_size = target_file.stat().st_size
-                if msg_id in manifest and manifest[msg_id].get("status") == "complete" and file_size > 0:
-                    print(f"[Skip] Msg {message.id} ({clean_filename}) - Already on D:")
+            if target_file.exists() and target_file.stat().st_size > 0:
+                if msg_id in manifest and manifest[msg_id].get("status") == "complete":
                     total_skipped += 1
                     continue
 
-            print(f"\n[Download] Msg {message.id}: {clean_filename}")
-            try:
-                await client.download_media(message, file=str(target_file), progress_callback=progress_callback)
-                print("") # newline after progress bar
+            # Queue task into bounded async worker pool
+            task = asyncio.create_task(
+                download_worker(client, message, target_file, clean_filename, current_section, msg_id)
+            )
+            download_tasks.append(task)
+            
+            # Stagger dispatch slightly to prevent burst connection spikes
+            await asyncio.sleep(WORKER_JITTER_DELAY_SEC)
 
-                manifest[msg_id] = {
-                    "status": "complete",
-                    "path": str(target_file),
-                    "filename": clean_filename,
-                    "section": current_section,
-                    "size_bytes": target_file.stat().st_size if target_file.exists() else 0
-                }
-                save_manifest()
-                total_downloaded += 1
+    print(f"\n[Queue Manager] Dispatched {len(download_tasks)} download tasks. Processing parallel pool...\n")
 
-            except Exception as e:
-                print(f"\nError downloading Msg {message.id}: {e}")
+    if download_tasks:
+        results = await asyncio.gather(*download_tasks)
+        total_downloaded = sum(1 for r in results if r is True)
+    else:
+        total_downloaded = 0
 
     print("\n==================================================================")
     print("ALL FILES BATCH DOWNLOAD COMPLETE!")
-    print(f"Total Files/Media Found: {total_found}")
-    print(f"Successfully Downloaded: {total_downloaded}")
+    print(f"Total Files Found:       {total_found}")
     print(f"Skipped (Already on D:): {total_skipped}")
-    print(f"All Files saved in:       {DOWNLOAD_ROOT}")
+    print(f"Successfully Downloaded: {total_downloaded}")
+    print(f"All Files Saved In:      {DOWNLOAD_ROOT}")
     print("==================================================================")

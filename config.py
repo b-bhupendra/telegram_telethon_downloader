@@ -14,5 +14,11 @@ DOWNLOAD_ROOT = Path("D:/Telegram_Downloads/Codebasic_Bootcamp")
 SESSION_FILE = DOWNLOAD_ROOT / "telegram_user.session"
 MANIFEST_FILE = DOWNLOAD_ROOT / "download_manifest.json"
 
+# Rate Limit & Anti-Ban Bounds
+MAX_CONCURRENT_DOWNLOADS = 3       # 3 parallel workers (Optimal safe threshold to prevent FloodWait)
+LARGE_FILE_THRESHOLD_MB = 20        # Files > 20MB use FastTelethon parallel chunk streaming
+WORKER_JITTER_DELAY_SEC = 0.3      # Stagger delay between worker dispatches
+RETRY_ATTEMPTS = 3
+
 # Ensure output directory exists
 DOWNLOAD_ROOT.mkdir(parents=True, exist_ok=True)
