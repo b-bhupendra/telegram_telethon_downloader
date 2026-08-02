@@ -63,11 +63,14 @@ async def download_worker(client, message, target_file, clean_filename, current_
     async with semaphore:
         slot_id = await worker_slots.get()
 
-        # AGGRESSIVE TRUNCATION: Exactly 20 chars, padded. Prevents line-wrap tearing!
-        if len(clean_filename) > 20:
-            disp_name = clean_filename[:17] + "..."
+        # Display: show msg ID + truncated name for unique identification
+        short_name = clean_filename.split("_", 1)[-1] if "_" in clean_filename else clean_filename
+        disp_tag = f"#{msg_id}"
+        max_name_len = 20 - len(disp_tag) - 1  # leave room for ID + space
+        if len(short_name) > max_name_len:
+            disp_name = f"{disp_tag} {short_name[:max_name_len - 3]}..."
         else:
-            disp_name = f"{clean_filename:<20}"
+            disp_name = f"{disp_tag} {short_name:<{max_name_len}}"
 
         file_size = getattr(message, "file", None).size if getattr(message, "file", None) else 0
         if not file_size and hasattr(message.media, "document"):
@@ -201,7 +204,9 @@ async def run_telethon_downloader():
             elif isinstance(message.media, MessageMediaPhoto):
                 filename = f"photo_{message.id}.jpg"
 
-            clean_filename = "".join([c if c.isalnum() or c in " ._-" else "_" for c in filename])
+            # Sanitize then prepend message ID to guarantee unique filenames across the channel
+            clean_base = "".join([c if c.isalnum() or c in " ._-" else "_" for c in filename])
+            clean_filename = f"{message.id}_{clean_base}"
             target_file = target_folder / clean_filename
 
             expected_size = getattr(message, "file", None).size if getattr(message, "file", None) else 0
