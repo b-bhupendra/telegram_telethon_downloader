@@ -47,32 +47,39 @@ if MANIFEST_FILE.exists():
     except Exception:
         manifest = {}
 
-async def save_manifest_async():
+async def save_manifest_async(progress_context=None):
     def _write():
         try:
             with open(MANIFEST_FILE, "w", encoding="utf-8") as f:
                 json.dump(manifest, f, indent=2)
         except Exception as e:
-            console.print(f"[red][Error saving manifest]: {e}[/red]")
+            # Safely print above the progress bar if context exists
+            if progress_context:
+                progress_context.console.print(f"[red][Error saving manifest]: {e}[/red]")
     await asyncio.to_thread(_write)
 
 async def download_worker(client, message, target_file, clean_filename, current_section, msg_id, progress, overall_task_id):
     """Parallel download worker using Rich progress bars."""
     async with semaphore:
         slot_id = await worker_slots.get()
-        disp_name = clean_filename if len(clean_filename) <= 30 else (clean_filename[:27] + "...")
-        
+
+        # AGGRESSIVE TRUNCATION: Exactly 20 chars, padded. Prevents line-wrap tearing!
+        if len(clean_filename) > 20:
+            disp_name = clean_filename[:17] + "..."
+        else:
+            disp_name = f"{clean_filename:<20}"
+
         file_size = getattr(message, "file", None).size if getattr(message, "file", None) else 0
         if not file_size and hasattr(message.media, "document"):
             file_size = getattr(message.media.document, "size", 0)
 
-        # Add a new progress bar task for this specific file
-        task_id = progress.add_task("download", filename=disp_name, total=file_size if file_size > 0 else None)
+        task_id = progress.add_task("download", filename=disp_name, total=file_size if file_size > 0 else None, custom_stats="")
 
         def progress_callback(current, total):
-            if total > 0 and progress.tasks[task_id].total != total:
-                progress.update(task_id, total=total)
-            progress.update(task_id, completed=current)
+            if total > 0:
+                progress.update(task_id, completed=current, total=total)
+            else:
+                progress.update(task_id, completed=current)
 
         success = False
         large_file_bytes = LARGE_FILE_THRESHOLD_MB * 1024 * 1024
@@ -81,11 +88,7 @@ async def download_worker(client, message, target_file, clean_filename, current_
             try:
                 if file_size >= large_file_bytes and message.media:
                     success = await download_file_parallel(
-                        client, 
-                        message.media, 
-                        target_file, 
-                        file_size, 
-                        progress_callback=progress_callback
+                        client, message.media, target_file, file_size, progress_callback=progress_callback
                     )
                 else:
                     await client.download_media(message, file=str(target_file), progress_callback=progress_callback)
@@ -99,24 +102,27 @@ async def download_worker(client, message, target_file, clean_filename, current_
                         "section": current_section,
                         "size_bytes": target_file.stat().st_size
                     }
-                    await save_manifest_async()
+                    await save_manifest_async(progress_context=progress)
                     break
+
             except errors.FloodWaitError as e:
-                progress.update(task_id, filename=f"[yellow]Paused {e.seconds}s (RateLimit)[/yellow]")
+                progress.update(task_id, filename=f"[yellow]{'Paused (RateLimit)':<20}[/yellow]")
                 await asyncio.sleep(e.seconds + 2)
-                progress.update(task_id, filename=disp_name) # Restore name
+                progress.update(task_id, filename=disp_name)
             except Exception as e:
-                progress.update(task_id, filename=f"[red]Retry {attempt}/{RETRY_ATTEMPTS}[/red]")
+                # SAFE PRINT: Does not corrupt the progress buffer
+                progress.console.print(f"[red]Worker {slot_id} Error on {disp_name.strip()}: {e}[/red]")
+                progress.update(task_id, filename=f"[red]{f'Retry {attempt}/{RETRY_ATTEMPTS}':<20}[/red]")
                 await asyncio.sleep(2)
                 progress.update(task_id, filename=disp_name)
 
         # Hide the bar when finished to keep the terminal clean
         progress.update(task_id, visible=False)
         worker_slots.put_nowait(slot_id)
-        
+
         if overall_task_id is not None:
             progress.update(overall_task_id, advance=1)
-            
+
         return success
 
 async def run_telethon_downloader():
@@ -227,30 +233,42 @@ async def run_telethon_downloader():
         console.print("[bold green]All channel media files are already downloaded and synchronized on Drive D:![/bold green]")
         return
 
-    # \U0001f308 Funky Custom Progress Bar Settings
+    # \U0001f308 Glitch-Proof Progress Bar Layout
     with Progress(
-        TextColumn("[bold #FFD700]{task.fields[filename]}", justify="right"),
+        TextColumn("[bold #FFD700]{task.fields[filename]}", justify="left"),
         BarColumn(
-            bar_width=None, 
+            bar_width=30,  # Hardcoded width prevents terminal-resizing from breaking layout
             style="color(237)",
             complete_style="#00FF00",
             finished_style="#FF00FF"
         ),
         "[progress.percentage][bold #00FFFF]{task.percentage:>3.1f}%[/]",
         "\u2022",
-        DownloadColumn(),
-        "\u2022",
-        TransferSpeedColumn(),
-        "\u2022",
-        TimeRemainingColumn(),
-        console=console
+        TextColumn("{task.fields[custom_stats]}", justify="left"),
+        console=console,
+        expand=False  # Prevents stretching and wrapping
     ) as progress:
-        
-        overall_task_id = progress.add_task("overall", filename="[bold #39FF14]\U0001f680 OVERALL PROGRESS", total=len(pending_tasks_data))
+
+        # Overall task uses custom_stats to format items as Files, not bytes
+        overall_task_id = progress.add_task(
+            "overall",
+            filename="[bold #39FF14]\U0001f680 OVERALL PROGRESS  ",
+            total=len(pending_tasks_data),
+            custom_stats=f"[#39FF14]0/{len(pending_tasks_data)} Files[/]"
+        )
+
+        # Wrapped worker updates overall counter with correct "X/Y Files" text
+        async def wrapped_worker(msg, t_file, c_file, sec, m_id):
+            res = await download_worker(client, msg, t_file, c_file, sec, m_id, progress, None)
+            if res:
+                progress.update(overall_task_id, advance=1)
+                completed = progress.tasks[overall_task_id].completed
+                progress.update(overall_task_id, custom_stats=f"[#39FF14]{int(completed)}/{len(pending_tasks_data)} Files[/]")
+            return res
 
         download_tasks = [
             asyncio.create_task(
-                download_worker(client, message, target_file, clean_filename, sec, msg_id, progress, overall_task_id)
+                wrapped_worker(message, target_file, clean_filename, sec, msg_id)
             )
             for message, target_file, clean_filename, sec, msg_id in pending_tasks_data
         ]
