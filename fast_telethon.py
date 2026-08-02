@@ -6,14 +6,21 @@ from telethon import TelegramClient
 from config import CHUNK_SIZE, PARALLEL_CHUNKS_PER_FILE
 
 async def download_chunk_with_retry(client: TelegramClient, location, offset: int, limit: int, retries: int = 3) -> bytes:
-    """Downloads a single byte-range chunk with automatic retry logic."""
+    """Downloads a single byte-range chunk using iter_download with automatic retry logic."""
     for attempt in range(1, retries + 1):
         try:
-            data = await client.download_file(location, offset=offset, limit=limit)
+            data = b""
+            # iter_download correctly resolves the media location and respects byte offsets
+            async for chunk in client.iter_download(location, offset=offset, request_size=1024 * 1024):
+                data += chunk
+                if len(data) >= limit:
+                    break
+                    
             if data:
-                return data
-        except Exception:
+                return data[:limit]  # Strictly truncate to the requested limit
+        except Exception as e:
             if attempt == retries:
+                print(f"[Chunk Error at offset {offset}]: {e}")
                 return b""
             await asyncio.sleep(1)
     return b""
@@ -55,6 +62,7 @@ async def download_file_parallel(
                     f.seek(offset)
                     f.write(chunk_data)
                 
+                # Atomically update the progress bar
                 async with bytes_lock:
                     downloaded_bytes += len(chunk_data)
                     if progress_callback:
