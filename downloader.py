@@ -120,13 +120,18 @@ async def download_worker(client, message, target_file, clean_filename, current_
         return success
 
 async def run_telethon_downloader():
-    # Use Rich Panels for a clean UI Banner
+    # \U0001f680 Funky Neon Startup Banner
     banner_text = (
-        f"[bold cyan]Output Directory:[/bold cyan]     {DOWNLOAD_ROOT}\n"
-        f"[bold cyan]Max Concurrent Files:[/bold cyan] {MAX_CONCURRENT_DOWNLOADS}\n"
-        f"[bold cyan]Large File Threshold:[/bold cyan] {LARGE_FILE_THRESHOLD_MB} MB (Parallel Chunking Active)"
+        f"[bold #00FFFF]\U0001f4c2 Output Directory:[/bold #00FFFF]     [italic #FFFFFF]{DOWNLOAD_ROOT}[/]\n"
+        f"[bold #FF00FF]\u26a1 Max Concurrent Files:[/bold #FF00FF] [#00FF00]{MAX_CONCURRENT_DOWNLOADS}[/]\n"
+        f"[bold #FFA500]\U0001f525 Large File Threshold:[/bold #FFA500] [#00FF00]{LARGE_FILE_THRESHOLD_MB} MB[/] [italic](Parallel Chunking Active)[/]"
     )
-    console.print(Panel(banner_text, title="[bold green]TELEGRAM MTPROTO PARALLEL DOWNLOADER[/bold green]", expand=False))
+    console.print(Panel(
+        banner_text, 
+        title="[bold blink #39FF14]\U0001f47e TELEGRAM MTPROTO DOWNLOADER \U0001f47e[/]", 
+        border_style="#FF00FF",
+        expand=False
+    ))
 
     client = TelegramClient(
         str(SESSION_FILE),
@@ -141,18 +146,18 @@ async def run_telethon_downloader():
     )
 
     await client.start()
-    console.print("[green]Authenticated with Telegram MTProto API successfully![/green]\n")
+    console.print("[bold #00FF00]\U0001f513 Authenticated with Telegram MTProto API successfully![/]\n")
 
     entity = None
     try:
         entity = await client.get_entity(TARGET_CHANNEL_ID)
-        console.print(f"Connected to Channel: [bold]{getattr(entity, 'title', TARGET_CHANNEL_ID)}[/bold]")
+        console.print(f"\U0001f4e1 Connected to Channel: [bold #FFD700]{getattr(entity, 'title', TARGET_CHANNEL_ID)}[/]")
     except Exception:
-        console.print("Searching channel in user dialogs list...")
+        console.print("\U0001f50d Searching channel in user dialogs list...")
         async for dialog in client.iter_dialogs():
             if dialog.id == TARGET_CHANNEL_ID or str(TARGET_CHANNEL_ID) in str(dialog.id):
                 entity = dialog.entity
-                console.print(f"Found Channel: [bold]{dialog.name}[/bold]")
+                console.print(f"\U0001f50d Found Channel: [bold #FFD700]{dialog.name}[/]")
                 break
 
     if not entity:
@@ -164,7 +169,7 @@ async def run_telethon_downloader():
     total_skipped = 0
     pending_tasks_data = []
 
-    console.print("[cyan]Scanning message history and cataloging media items...[/cyan]")
+    console.print("[bold #00FFFF]\U0001f300 Scanning message history and cataloging media items...[/]")
     async for message in client.iter_messages(entity, reverse=True):
         text = message.text or ""
         if text and len(text) < 120 and any(kw in text.lower() for kw in ["module", "day", "chapter", "section", "#", "part", "lecture", "assignment"]):
@@ -222,21 +227,26 @@ async def run_telethon_downloader():
         console.print("[bold green]All channel media files are already downloaded and synchronized on Drive D:![/bold green]")
         return
 
-    # Set up the Rich Progress Live Display
+    # \U0001f308 Funky Custom Progress Bar Settings
     with Progress(
-        TextColumn("[bold blue]{task.fields[filename]}", justify="right"),
-        BarColumn(bar_width=None),
-        "[progress.percentage]{task.percentage:>3.1f}%",
-        "•",
+        TextColumn("[bold #FFD700]{task.fields[filename]}", justify="right"),
+        BarColumn(
+            bar_width=None, 
+            style="color(237)",
+            complete_style="#00FF00",
+            finished_style="#FF00FF"
+        ),
+        "[progress.percentage][bold #00FFFF]{task.percentage:>3.1f}%[/]",
+        "\u2022",
         DownloadColumn(),
-        "•",
+        "\u2022",
         TransferSpeedColumn(),
-        "•",
+        "\u2022",
         TimeRemainingColumn(),
         console=console
     ) as progress:
         
-        overall_task_id = progress.add_task("overall", filename="[bold green]OVERALL PROGRESS", total=len(pending_tasks_data))
+        overall_task_id = progress.add_task("overall", filename="[bold #39FF14]\U0001f680 OVERALL PROGRESS", total=len(pending_tasks_data))
 
         download_tasks = [
             asyncio.create_task(
@@ -249,11 +259,17 @@ async def run_telethon_downloader():
 
     total_downloaded = sum(1 for r in results if r is True)
     
+    # \U0001f389 Funky Completion Summary
     summary_text = (
-        f"Total Files Found:       {total_found}\n"
-        f"Skipped (Already on D:): {total_skipped}\n"
-        f"[green]Successfully Downloaded: {total_downloaded}[/green]\n"
-        f"All Files Saved In:      {DOWNLOAD_ROOT}"
+        f"[bold #00FFFF]Total Files Found:[/bold #00FFFF]       {total_found}\n"
+        f"[bold #FFA500]Skipped (Already on D:):[/bold #FFA500] {total_skipped}\n"
+        f"[bold #00FF00]Successfully Downloaded: {total_downloaded}[/bold #00FF00]\n"
+        f"[bold #FF00FF]All Files Saved In:[/bold #FF00FF]      [italic]{DOWNLOAD_ROOT}[/]"
     )
     console.print("\n")
-    console.print(Panel(summary_text, title="[bold green]BATCH DOWNLOAD COMPLETE![/bold green]", expand=False))
+    console.print(Panel(
+        summary_text, 
+        title="[bold #39FF14]\U0001f389 BATCH DOWNLOAD COMPLETE! \U0001f389[/]", 
+        border_style="#00FFFF",
+        expand=False
+    ))
