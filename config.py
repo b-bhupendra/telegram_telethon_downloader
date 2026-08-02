@@ -15,7 +15,7 @@ SESSION_FILE = DOWNLOAD_ROOT / "telegram_user.session"
 MANIFEST_FILE = DOWNLOAD_ROOT / "download_manifest.json"
 
 # Rate Limit & Anti-Ban Bounds
-MAX_CONCURRENT_DOWNLOADS = 3       # 3 parallel workers (Optimal safe threshold to prevent FloodWait)
+MAX_CONCURRENT_DOWNLOADS = 5       # 5 parallel workers (Maximum safe speed limit)
 LARGE_FILE_THRESHOLD_MB = 20        # Files > 20MB use FastTelethon parallel chunk streaming
 WORKER_JITTER_DELAY_SEC = 0.3      # Stagger delay between worker dispatches
 RETRY_ATTEMPTS = 3
