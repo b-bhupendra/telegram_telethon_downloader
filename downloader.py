@@ -1,5 +1,4 @@
-# downloader.py - High-Performance Anti-Ban Parallel MTProto Downloader with tqdm Progress Bars
-
+# downloader.py - High-Performance Anti-Ban Parallel MTProto Downloader
 import os
 import sys
 import json
@@ -18,17 +17,18 @@ except ImportError:
 try:
     from tqdm import tqdm
 except ImportError:
-    print("[Dependency] Installing tqdm for multi-bar progress display...")
+    print("[Dependency] Installing tqdm...")
     os.system("pip install tqdm")
     from tqdm import tqdm
 
 from config import (
     API_ID, API_HASH, TARGET_CHANNEL_ID,
     DOWNLOAD_ROOT, SESSION_FILE, MANIFEST_FILE,
-    MAX_CONCURRENT_DOWNLOADS, WORKER_JITTER_DELAY_SEC, RETRY_ATTEMPTS
+    MAX_CONCURRENT_DOWNLOADS, LARGE_FILE_THRESHOLD_MB,
+    FLOOD_SLEEP_THRESHOLD, CONNECTION_RETRIES, RETRY_ATTEMPTS
 )
+from fast_telethon import download_file_parallel
 
-# Concurrency Semaphore bounded to safe non-bannable threshold (3 concurrent workers)
 semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 worker_slots = asyncio.Queue()
 for i in range(1, MAX_CONCURRENT_DOWNLOADS + 1):
@@ -42,7 +42,6 @@ if MANIFEST_FILE.exists():
     except Exception:
         manifest = {}
 
-# Asynchronous non-blocking manifest writer
 async def save_manifest_async():
     def _write():
         try:
@@ -53,15 +52,17 @@ async def save_manifest_async():
     await asyncio.to_thread(_write)
 
 async def download_worker(client, message, target_file, clean_filename, current_section, msg_id, overall_pbar):
-    """Parallel download worker task with individual tqdm progress bar per file."""
+    """Parallel download worker routing tasks dynamically between standard & chunk engines."""
     async with semaphore:
         slot_id = await worker_slots.get()
-        
-        # Trim filename for clean console progress display
         disp_name = clean_filename if len(clean_filename) <= 32 else (clean_filename[:29] + "...")
         
+        file_size = getattr(message, "file", None).size if getattr(message, "file", None) else 0
+        if not file_size and hasattr(message.media, "document"):
+            file_size = getattr(message.media.document, "size", 0)
+
         pbar = tqdm(
-            total=0,
+            total=file_size if file_size > 0 else 0,
             unit='B',
             unit_scale=True,
             unit_divisor=1024,
@@ -76,23 +77,33 @@ async def download_worker(client, message, target_file, clean_filename, current_
             pbar.update(current - pbar.n)
 
         success = False
+        large_file_bytes = LARGE_FILE_THRESHOLD_MB * 1024 * 1024
+
         for attempt in range(1, RETRY_ATTEMPTS + 1):
             try:
-                # Telethon MTProto stream with live progress callback
-                await client.download_media(message, file=str(target_file), progress_callback=progress_callback)
+                # Fast parallel chunk engine for large files; single stream for small files
+                if file_size >= large_file_bytes and message.media:
+                    success = await download_file_parallel(
+                        client, 
+                        message.media, 
+                        target_file, 
+                        file_size, 
+                        progress_callback=progress_callback
+                    )
+                else:
+                    await client.download_media(message, file=str(target_file), progress_callback=progress_callback)
+                    success = True
 
-                # Record completion atomically
-                manifest[msg_id] = {
-                    "status": "complete",
-                    "path": str(target_file),
-                    "filename": clean_filename,
-                    "section": current_section,
-                    "size_bytes": target_file.stat().st_size if target_file.exists() else 0
-                }
-                await save_manifest_async()
-                success = True
-                break
-
+                if success and target_file.exists():
+                    manifest[msg_id] = {
+                        "status": "complete",
+                        "path": str(target_file),
+                        "filename": clean_filename,
+                        "section": current_section,
+                        "size_bytes": target_file.stat().st_size
+                    }
+                    await save_manifest_async()
+                    break
             except errors.FloodWaitError as e:
                 pbar.set_description(f"Worker {slot_id} | Paused {e.seconds}s (RateLimit)")
                 await asyncio.sleep(e.seconds + 2)
@@ -110,10 +121,11 @@ async def download_worker(client, message, target_file, clean_filename, current_
 
 async def run_telethon_downloader():
     print("==================================================================")
-    print("TELEGRAM PARALLEL MTPROTO DOWNLOADER (ANTI-BAN SAFE, DRIVE D:)")
+    print("TELEGRAM OPTIMIZED MTPROTO PARALLEL DOWNLOADER (ANTI-BAN SAFE)")
     print("==================================================================")
     print(f"Output Directory:     {DOWNLOAD_ROOT}")
-    print(f"Max Parallel Workers: {MAX_CONCURRENT_DOWNLOADS} (Rate-limit Safe)")
+    print(f"Max Concurrent Files: {MAX_CONCURRENT_DOWNLOADS}")
+    print(f"Large File Threshold: {LARGE_FILE_THRESHOLD_MB} MB (Parallel Chunking Active)")
     print("==================================================================\n")
 
     client = TelegramClient(
@@ -122,9 +134,12 @@ async def run_telethon_downloader():
         API_HASH,
         device_model="Desktop Parallel Node",
         system_version="Windows 11",
-        app_version="4.16.30"
+        app_version="4.16.30",
+        connection_retries=CONNECTION_RETRIES,
+        retry_delay=2,
+        flood_sleep_threshold=FLOOD_SLEEP_THRESHOLD
     )
-    
+
     await client.start()
     print("Authenticated with Telegram MTProto API successfully!")
 
@@ -150,26 +165,20 @@ async def run_telethon_downloader():
     pending_tasks_data = []
 
     print("\nScanning message history and cataloging media items...\n")
-
     async for message in client.iter_messages(entity, reverse=True):
         text = message.text or ""
-
-        # Section Heading Detection
         if text and len(text) < 120 and any(kw in text.lower() for kw in ["module", "day", "chapter", "section", "#", "part", "lecture", "assignment"]):
             clean_heading = "".join([c if c.isalnum() or c in " _-" else "_" for c in text.strip()])
             current_section = clean_heading[:60].strip()
 
-        # Process ALL media items (Videos, Documents, Zip, PDF, Code, Photos, Audio)
         if message.media:
             total_found += 1
             msg_id = str(message.id)
-
             target_folder = DOWNLOAD_ROOT / current_section
             target_folder.mkdir(parents=True, exist_ok=True)
 
             filename = f"file_msg_{message.id}"
             doc = getattr(message.media, "document", None)
-
             if doc:
                 filename_attr = next((a.file_name for a in doc.attributes if isinstance(a, DocumentAttributeFilename) and a.file_name), None)
                 if filename_attr:
@@ -184,13 +193,26 @@ async def run_telethon_downloader():
             clean_filename = "".join([c if c.isalnum() or c in " ._-" else "_" for c in filename])
             target_file = target_folder / clean_filename
 
-            # Resumability check
+            # Strict Resumability Verification
+            expected_size = getattr(message, "file", None).size if getattr(message, "file", None) else 0
             if target_file.exists() and target_file.stat().st_size > 0:
                 if msg_id in manifest and manifest[msg_id].get("status") == "complete":
                     total_skipped += 1
                     continue
+                elif expected_size > 0 and target_file.stat().st_size == expected_size:
+                    manifest[msg_id] = {
+                        "status": "complete",
+                        "path": str(target_file),
+                        "filename": clean_filename,
+                        "section": current_section,
+                        "size_bytes": target_file.stat().st_size
+                    }
+                    total_skipped += 1
+                    continue
 
             pending_tasks_data.append((message, target_file, clean_filename, current_section, msg_id))
+
+    await save_manifest_async()
 
     print(f"\nCatalog Summary:")
     print(f"   Total Media Found:   {total_found}")
@@ -198,10 +220,9 @@ async def run_telethon_downloader():
     print(f"   Pending Downloads:   {len(pending_tasks_data)}\n")
 
     if not pending_tasks_data:
-        print("🎉 All channel media files are already downloaded and synchronized on Drive D:!")
+        print("  All channel media files are already downloaded and synchronized on Drive D:!")
         return
 
-    # Create Overall Channel Progress Bar
     overall_pbar = tqdm(
         total=len(pending_tasks_data),
         desc="Overall Channel Progress",
@@ -210,19 +231,18 @@ async def run_telethon_downloader():
         leave=True
     )
 
-    download_tasks = []
-    for message, target_file, clean_filename, sec, msg_id in pending_tasks_data:
-        task = asyncio.create_task(
+    # Instant non-blocking dispatch governed strictly by Semaphore limits
+    download_tasks = [
+        asyncio.create_task(
             download_worker(client, message, target_file, clean_filename, sec, msg_id, overall_pbar)
         )
-        download_tasks.append(task)
-        await asyncio.sleep(WORKER_JITTER_DELAY_SEC)
+        for message, target_file, clean_filename, sec, msg_id in pending_tasks_data
+    ]
 
     results = await asyncio.gather(*download_tasks)
     overall_pbar.close()
 
     total_downloaded = sum(1 for r in results if r is True)
-
     print("\n==================================================================")
     print("ALL FILES BATCH DOWNLOAD COMPLETE!")
     print(f"Total Files Found:       {total_found}")
