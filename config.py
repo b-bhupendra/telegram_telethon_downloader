@@ -14,7 +14,7 @@ SESSION_FILE = DOWNLOAD_ROOT / "telegram_user.session"
 MANIFEST_FILE = DOWNLOAD_ROOT / "download_manifest_namastesql.json"
 
 # Rate Limit & Anti-Ban Speed Settings
-MAX_CONCURRENT_DOWNLOADS = 5       # Concurrent files downloading in parallel
+MAX_CONCURRENT_DOWNLOADS = 2       # Concurrent files downloading in parallel
 PARALLEL_CHUNKS_PER_FILE = 4       # Concurrent chunk streams per large file
 CHUNK_SIZE = 1024 * 1024           # 1 MB per chunk (Optimal MTProto size)
 LARGE_FILE_THRESHOLD_MB = 20       # Files >= 20 MB use FastTelethon parallel chunking
