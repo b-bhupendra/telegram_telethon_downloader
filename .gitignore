@@ -1,4 +1,6 @@
-# .gitignore for Telegram Telethon Downloader
+﻿# .gitignore for Telegram Telethon Downloader
+.venv/
+venv/
 *.session
 *.session-journal
 __pycache__/
