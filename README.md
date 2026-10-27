@@ -8,21 +8,24 @@ A high-performance, server-direct MTProto downloader project for Telegram media 
 
 ```
 telegram_telethon_downloader/
-├── .venv/               # Virtual environment (Telethon, Rich)
+├── .venv/               # Virtual environment (Telethon, Rich, cryptg)
 ├── config.py            # API_ID, API_HASH, target channel ID, D: drive paths
 ├── downloader.py        # Core Telethon MTProto download engine with Rich UI
-├── fast_telethon.py     # Parallel 1MB byte-range chunk downloader
+├── fast_telethon.py     # Multi-connection parallel chunk streamer
 ├── main.py              # CLI entry point (supports --clean flag)
 ├── README.md            # Usage guide
-└── requirements.txt     # Python dependencies (telethon, rich)
+└── requirements.txt     # Python dependencies (telethon, rich, cryptg)
 ```
 
 ---
 
 ## Features
 
-- **FastTelethon Parallel Chunking**: Streams 1MB chunks concurrently per large file (≥20MB) to saturate full bandwidth.
-- **Interactive Channel Selection**: Lists dialogs/channels with a formatted Rich table if `TARGET_CHANNEL_ID` is not preset or dynamic routing is desired.
+- **`cryptg` C/Assembly Acceleration**: Uses hardware AES-NI instructions for MTProto encryption/decryption, avoiding the ~200–300 kB/s CPU bottleneck of pure-Python `pyaes` (delivers 10×–50× faster throughput).
+- **FastTelethon Multi-Socket Streaming**: Opens parallel TCP connections (`ParallelTransferrer`) directly to Telegram Data Centers using optimal 512 KB native chunks for large files.
+- **Forum Supergroup Topic Support**: Automatically identifies Telegram Forum Supergroups, discovers subchannels/topics, and downloads into clean topic subdirectories (`D:\Telegram_Downloads\<Group>\<Topic>\`).
+- **Resilient Manifest Tracking**: `download_manifest.json` tracks Telegram IDs, topic IDs, file sizes, and status for instant glitch-proof resumption.
+- **Interactive Channel & Topic Selection**: Lists channels with spam filters and allows selecting specific topics or downloading all course topics with one keystroke.
 - **Portable Session Auto-Discovery**: Automatically discovers any `.session` file in the project folder (or `sessions/` or download directory). If you copy-paste any `.session` file into the project folder, it will instantly pick up that account without re-prompting for OTP.
 - **Safe Session Preservation**: Session files (`*.session`) are protected from clean-up commands (`main.py --clean`) and ignored by git (`.gitignore`).
 - **Drive D: Storage Isolation**: All downloads and logs are isolated on `D:\` drive.
@@ -31,10 +34,11 @@ telegram_telethon_downloader/
 
 ## How to Run
 
-1. **Activate the Virtual Environment**:
+1. **Activate the Virtual Environment & Install Requirements**:
    ```powershell
    cd D:\Projects\telegram_telethon_downloader
    .\.venv\Scripts\activate
+   pip install -r requirements.txt
    ```
 
 2. **Run the Downloader**:
