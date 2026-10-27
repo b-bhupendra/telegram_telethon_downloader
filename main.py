@@ -4,6 +4,15 @@ import sys
 import shutil
 import asyncio
 from pathlib import Path
+
+# Fix Windows console emoji encoding
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+        sys.stdin.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 from config import DOWNLOAD_ROOT, MANIFEST_FILE, SESSION_FILE
 from downloader import run_telethon_downloader
 
@@ -21,9 +30,9 @@ def clean_old_downloads():
         except Exception as e:
             print(f"Warning deleting manifest: {e}")
 
-    # Remove subfolders/files inside DOWNLOAD_ROOT, EXCEPT telegram_user.session
+    # Remove subfolders/files inside DOWNLOAD_ROOT, EXCEPT session files
     for item in DOWNLOAD_ROOT.iterdir():
-        if item.resolve() == SESSION_FILE.resolve():
+        if item.resolve() == SESSION_FILE.resolve() or item.suffix == ".session" or item.name.startswith("telegram_user.session"):
             continue  # NEVER delete user login session!
         
         try:

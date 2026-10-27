@@ -5,6 +5,14 @@ import json
 import asyncio
 from pathlib import Path
 
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+        sys.stdin.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
 try:
     from telethon import TelegramClient, errors
     from telethon.tl.types import MessageMediaDocument, MessageMediaPhoto, DocumentAttributeFilename
@@ -33,9 +41,47 @@ from config import (
     API_ID, API_HASH, TARGET_CHANNEL_ID,
     DOWNLOAD_ROOT, SESSION_FILE, MANIFEST_FILE,
     MAX_CONCURRENT_DOWNLOADS, LARGE_FILE_THRESHOLD_MB,
-    FLOOD_SLEEP_THRESHOLD, CONNECTION_RETRIES, RETRY_ATTEMPTS
+    FLOOD_SLEEP_THRESHOLD, CONNECTION_RETRIES, RETRY_ATTEMPTS,
+    BASE_DOWNLOAD_DIR, IGNORED_DIALOG_KEYWORDS, IGNORED_TOPIC_KEYWORDS, clean_name
 )
+try:
+    from config import PHONE_NUMBER
+except ImportError:
+    PHONE_NUMBER = None
+from telethon.tl.functions.messages import GetForumTopicsRequest
 from fast_telethon import download_file_parallel
+
+async def fetch_forum_topics(client, entity):
+    """Fetches all topics from a forum supergroup. Returns dict: {topic_id: topic_title}."""
+    topics = {}
+    try:
+        input_peer = await client.get_input_entity(entity)
+        offset_date = None
+        offset_id = 0
+        offset_topic = 0
+        while True:
+            res = await client(GetForumTopicsRequest(
+                peer=input_peer,
+                offset_date=offset_date,
+                offset_id=offset_id,
+                offset_topic=offset_topic,
+                limit=100
+            ))
+            if not res or not res.topics:
+                break
+            for t in res.topics:
+                t_id = getattr(t, 'id', None)
+                t_title = getattr(t, 'title', None)
+                if t_id and t_title:
+                    topics[t_id] = t_title
+            if len(res.topics) < 100:
+                break
+            last_topic = res.topics[-1]
+            offset_topic = last_topic.id
+            offset_id = getattr(last_topic, 'top_message', 0)
+    except Exception as e:
+        console.print(f"[yellow]⚠️ Could not fetch forum topics via MTProto: {e}[/yellow]")
+    return topics
 
 console = Console()
 semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
@@ -92,7 +138,7 @@ class SmartTimeRemainingColumn(TimeRemainingColumn):
 # ------------------------
 
 
-async def download_worker(client, message, target_file, clean_filename, current_section, msg_id, progress, overall_task_id):
+async def download_worker(client, message, target_file, clean_filename, current_section, msg_id, progress, overall_task_id, topic_id=None, topic_title=""):
     """Parallel download worker using Rich progress bars."""
     async with semaphore:
         slot_id = await worker_slots.get()
@@ -135,6 +181,8 @@ async def download_worker(client, message, target_file, clean_filename, current_
                         "path": str(target_file),
                         "filename": clean_filename,
                         "section": current_section,
+                        "topic_id": topic_id,
+                        "topic_title": topic_title,
                         "size_bytes": target_file.stat().st_size
                     }
                     await save_manifest_async(progress_context=progress)
@@ -186,17 +234,29 @@ async def run_telethon_downloader():
         flood_sleep_threshold=FLOOD_SLEEP_THRESHOLD
     )
 
-    await client.start()
-    console.print("[bold #00FF00]\U0001f513 Authenticated with Telegram MTProto API successfully![/]\n")
+    phone_to_use = PHONE_NUMBER if PHONE_NUMBER else (lambda: input('Please enter your phone (or bot token): '))
+    await client.start(
+        phone=phone_to_use,
+        password=lambda: input('Please enter your 2FA password: ')
+    )
+    console.print("[bold #00FF00]🔓 Authenticated with Telegram MTProto API successfully![/]\n")
 
     # Fetch all dialogs (channels, supergroups, groups)
     console.print("[bold #00FFFF]📡 Fetching your Telegram channels and groups...[/]")
     dialogs = await client.get_dialogs()
     
-    # Filter channels & groups primarily
-    relevant_dialogs = [d for d in dialogs if d.is_channel or d.is_group]
+    # Filter channels & groups, excluding unwanted spam/NSFW dialogs from config
+    relevant_dialogs = []
+    for d in dialogs:
+        if not (d.is_channel or d.is_group):
+            continue
+        d_name_lower = (d.name or "").lower()
+        if any(kw.lower() in d_name_lower for kw in IGNORED_DIALOG_KEYWORDS):
+            continue
+        relevant_dialogs.append(d)
+
     if not relevant_dialogs:
-        relevant_dialogs = dialogs
+        relevant_dialogs = [d for d in dialogs if d.is_channel or d.is_group]
 
     table = Table(title="[bold green]📱 Select a Channel / Group to Download From[/bold green]", border_style="#00FFFF")
     table.add_column("#", justify="right", style="cyan", no_wrap=True)
@@ -215,7 +275,7 @@ async def run_telethon_downloader():
             status_str = ""
 
         if d.is_channel and d.is_group:
-            dtype = "Supergroup"
+            dtype = "Supergroup (Forum)" if getattr(d.entity, 'forum', False) else "Supergroup"
         elif d.is_channel:
             dtype = "Channel"
         elif d.is_group:
@@ -263,13 +323,83 @@ async def run_telethon_downloader():
     channel_name = selected_dialog.name or f"Channel_{selected_dialog.id}"
     console.print(f"\n[bold #00FF00]🎯 Selected Channel: [bold #FFD700]{channel_name}[/bold #FFD700] (ID: {selected_dialog.id})[/bold #00FF00]\n")
 
-    # Set channel-specific output path and manifest file
-    clean_channel_folder = "".join([c if c.isalnum() or c in " _-" else "_" for c in channel_name]).strip() or f"channel_{selected_dialog.id}"
-    target_download_root = Path(f"D:/Telegram_Downloads/{clean_channel_folder}")
+    # Clean channel folder (removes emoji/symbol spam without ugly repeated underscores)
+    clean_channel_folder = clean_name(channel_name)
+    target_download_root = BASE_DOWNLOAD_DIR / clean_channel_folder
     target_download_root.mkdir(parents=True, exist_ok=True)
     target_manifest_file = target_download_root / "download_manifest.json"
 
     load_manifest(target_manifest_file)
+
+    # Forum Supergroup Topic Discovery
+    is_forum = getattr(entity, 'forum', False)
+    topics = {}
+    selected_topic_ids = set()
+
+    if is_forum:
+        console.print("[bold #00FFFF]🔍 Forum Supergroup detected! Fetching subchannels & topics...[/]")
+        topics = await fetch_forum_topics(client, entity)
+
+        if topics:
+            topic_table = Table(title=f"[bold green]📑 Subchannels / Topics in {clean_channel_folder}[/bold green]", border_style="#00FFFF")
+            topic_table.add_column("#", justify="right", style="cyan", no_wrap=True)
+            topic_table.add_column("Topic Title", style="bold white")
+            topic_table.add_column("Topic ID", style="dim")
+            topic_table.add_column("Status / Category", justify="center")
+
+            topics_list = list(topics.items())
+            default_course_indices = []
+
+            for idx, (t_id, t_title) in enumerate(topics_list, start=1):
+                t_lower = t_title.lower()
+                is_noise = any(kw.lower() in t_lower for kw in IGNORED_TOPIC_KEYWORDS)
+                if is_noise:
+                    status_desc = "[dim red]Chat/Noise (Skipped by default)[/dim red]"
+                else:
+                    status_desc = "[bold green]Active Course[/bold green]"
+                    default_course_indices.append(idx)
+                topic_table.add_row(str(idx), t_title, str(t_id), status_desc)
+
+            console.print(topic_table)
+
+            prompt_topics = f"\n[bold #00FFFF]👉 Select topics to download: [Press Enter for {len(default_course_indices)} course topics, 'all' for all, or enter numbers (e.g. 2, 3 / 2-5)]: [/bold #00FFFF]"
+            console.print(prompt_topics, end="")
+            t_choice = (await asyncio.to_thread(input)).strip()
+
+            if not t_choice:
+                selected_topic_ids = {topics_list[i-1][0] for i in default_course_indices}
+            elif t_choice.lower() in ["all", "*"]:
+                selected_topic_ids = {t_id for t_id, _ in topics_list}
+            else:
+                chosen_indices = set()
+                import re as re_mod
+                for part in re_mod.split(r'[\s,]+', t_choice):
+                    if '-' in part:
+                        try:
+                            s_idx, e_idx = part.split('-', 1)
+                            for n in range(int(s_idx), int(e_idx) + 1):
+                                if 1 <= n <= len(topics_list):
+                                    chosen_indices.add(n)
+                        except Exception:
+                            pass
+                    elif part.isdigit():
+                        n = int(part)
+                        if 1 <= n <= len(topics_list):
+                            chosen_indices.add(n)
+                if chosen_indices:
+                    selected_topic_ids = {topics_list[i-1][0] for i in chosen_indices}
+                else:
+                    selected_topic_ids = {topics_list[i-1][0] for i in default_course_indices}
+
+            sel_names = [topics[tid] for tid in selected_topic_ids if tid in topics]
+            console.print(f"[bold green]✅ Downloading {len(selected_topic_ids)} topic(s):[/bold green] {', '.join(sel_names)}\n")
+
+            manifest["_meta"] = {
+                "channel_id": str(selected_dialog.id),
+                "channel_name": channel_name,
+                "sanitized_folder": clean_channel_folder,
+                "topics": {str(t_id): {"title": t_name, "folder": clean_name(t_name)} for t_id, t_name in topics.items()}
+            }
 
     current_section = "00_General_Files"
     total_found = 0
@@ -280,14 +410,34 @@ async def run_telethon_downloader():
     async for message in client.iter_messages(entity, reverse=True):
         text = message.text or ""
         if text and len(text) < 120 and any(kw in text.lower() for kw in ["module", "day", "chapter", "section", "#", "part", "lecture", "assignment"]):
-            clean_heading = "".join([c if c.isalnum() or c in " _-" else "_" for c in text.strip()])
+            clean_heading = clean_name(text)
             current_section = clean_heading[:60].strip()
 
         if message.media:
-            total_found += 1
             msg_id = str(message.id)
-            target_folder = target_download_root / current_section
+            topic_id = None
+            topic_title = ""
+
+            if is_forum and topics:
+                if message.reply_to and getattr(message.reply_to, 'forum_topic', False):
+                    topic_id = getattr(message.reply_to, 'reply_to_top_id', None) or getattr(message.reply_to, 'reply_to_msg_id', None) or 1
+                elif message.reply_to and getattr(message.reply_to, 'reply_to_top_id', None):
+                    topic_id = message.reply_to.reply_to_top_id
+                else:
+                    topic_id = 1
+
+                if selected_topic_ids and topic_id not in selected_topic_ids:
+                    continue  # Filter out unselected topics
+
+                topic_title = topics.get(topic_id, f"Topic_{topic_id}")
+                clean_topic_folder = clean_name(topic_title)
+                target_folder = target_download_root / clean_topic_folder
+            else:
+                clean_section_folder = clean_name(current_section)
+                target_folder = target_download_root / clean_section_folder
+
             target_folder.mkdir(parents=True, exist_ok=True)
+            total_found += 1
 
             filename = f"file_msg_{message.id}"
             doc = getattr(message.media, "document", None)
@@ -303,8 +453,6 @@ async def run_telethon_downloader():
                 filename = f"photo_{message.id}.jpg"
 
             clean_base = "".join([c if c.isalnum() or c in " ._-" else "_" for c in filename])
-
-            # UNIQUE ID INJECTION: name_{msgid}.ext prevents concurrent .tmp file crashes
             name_part, ext_part = os.path.splitext(clean_base)
             clean_filename = f"{name_part}_{msg_id}{ext_part}"
 
@@ -321,12 +469,14 @@ async def run_telethon_downloader():
                         "path": str(target_file),
                         "filename": clean_filename,
                         "section": current_section,
+                        "topic_id": topic_id,
+                        "topic_title": topic_title,
                         "size_bytes": target_file.stat().st_size
                     }
                     total_skipped += 1
                     continue
 
-            pending_tasks_data.append((message, target_file, clean_filename, current_section, msg_id))
+            pending_tasks_data.append((message, target_file, clean_filename, current_section, msg_id, topic_id, topic_title))
 
     await save_manifest_async()
 
@@ -350,14 +500,13 @@ async def run_telethon_downloader():
         ),
         "[progress.percentage][bold #00FFFF]{task.percentage:>3.1f}%[/]",
         TextColumn("{task.fields[custom_stats]}", justify="left"),
-        SmartDownloadColumn(),       # Only renders for file tasks
-        SmartTransferSpeedColumn(),  # Only renders for file tasks
-        SmartTimeRemainingColumn(),  # Only renders for file tasks
+        SmartDownloadColumn(),
+        SmartTransferSpeedColumn(),
+        SmartTimeRemainingColumn(),
         console=console,
         expand=False
     ) as progress:
 
-        # is_overall=True hides Download, Speed, Time columns for this bar
         overall_task_id = progress.add_task(
             "overall",
             filename="[bold #39FF14]🚀 OVERALL PROGRESS    ",
@@ -366,8 +515,8 @@ async def run_telethon_downloader():
             is_overall=True
         )
 
-        async def wrapped_worker(msg, t_file, c_file, sec, m_id):
-            res = await download_worker(client, msg, t_file, c_file, sec, m_id, progress, overall_task_id)
+        async def wrapped_worker(msg, t_file, c_file, sec, m_id, top_id, top_name):
+            res = await download_worker(client, msg, t_file, c_file, sec, m_id, progress, overall_task_id, top_id, top_name)
             if res:
                 completed = progress.tasks[overall_task_id].completed
                 progress.update(overall_task_id, custom_stats=f" • [#39FF14]{int(completed)}/{len(pending_tasks_data)} Files[/]")
@@ -375,16 +524,15 @@ async def run_telethon_downloader():
 
         download_tasks = [
             asyncio.create_task(
-                wrapped_worker(message, target_file, clean_filename, sec, msg_id)
+                wrapped_worker(message, target_file, clean_filename, sec, msg_id, top_id, top_name)
             )
-            for message, target_file, clean_filename, sec, msg_id in pending_tasks_data
+            for message, target_file, clean_filename, sec, msg_id, top_id, top_name in pending_tasks_data
         ]
 
         results = await asyncio.gather(*download_tasks)
 
     total_downloaded = sum(1 for r in results if r is True)
 
-    # Funky Completion Summary
     summary_text = (
         f"[bold #00FFFF]Total Files Found:[/bold #00FFFF]       {total_found}\n"
         f"[bold #FFA500]Skipped (Already on D:):[/bold #FFA500] {total_skipped}\n"

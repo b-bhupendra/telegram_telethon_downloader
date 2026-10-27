@@ -1,4 +1,4 @@
-﻿# Telegram Telethon MTProto Downloader
+# Telegram Telethon MTProto Downloader
 
 A high-performance, server-direct MTProto downloader project for Telegram media and files using Telethon and parallel chunk streaming.
 
@@ -23,7 +23,8 @@ telegram_telethon_downloader/
 
 - **FastTelethon Parallel Chunking**: Streams 1MB chunks concurrently per large file (≥20MB) to saturate full bandwidth.
 - **Interactive Channel Selection**: Lists dialogs/channels with a formatted Rich table if `TARGET_CHANNEL_ID` is not preset or dynamic routing is desired.
-- **Safe Session Preservation**: Stores session in `D:/Telegram_Downloads/namastesql_hin_eng/telegram_user.session` — running `main.py --clean` wipes old downloads while keeping your login session intact.
+- **Portable Session Auto-Discovery**: Automatically discovers any `.session` file in the project folder (or `sessions/` or download directory). If you copy-paste any `.session` file into the project folder, it will instantly pick up that account without re-prompting for OTP.
+- **Safe Session Preservation**: Session files (`*.session`) are protected from clean-up commands (`main.py --clean`) and ignored by git (`.gitignore`).
 - **Drive D: Storage Isolation**: All downloads and logs are isolated on `D:\` drive.
 
 ---
