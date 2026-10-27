@@ -68,10 +68,10 @@ SESSION_FILE = resolve_session_file()
 MANIFEST_FILE = DOWNLOAD_ROOT / "download_manifest_namastesql.json"
 
 # Rate Limit & Anti-Ban Speed Settings
-MAX_CONCURRENT_DOWNLOADS = 2       # Concurrent files downloading in parallel
-PARALLEL_CHUNKS_PER_FILE = 4       # Concurrent chunk streams per large file
-CHUNK_SIZE = 1024 * 1024           # 1 MB per chunk (Optimal MTProto size)
-LARGE_FILE_THRESHOLD_MB = 20       # Files >= 20 MB use FastTelethon parallel chunking
+MAX_CONCURRENT_DOWNLOADS = 3       # Concurrent files downloading in parallel
+PARALLEL_CHUNKS_PER_FILE = 4       # Concurrent MTProto socket streams per large file
+CHUNK_SIZE = 512 * 1024            # 512 KB per chunk (Optimal Telegram MTProto limit)
+LARGE_FILE_THRESHOLD_MB = 10       # Files >= 10 MB use FastTelethon multi-connection streaming
 
 # Connection & Anti-Ban Bounds
 FLOOD_SLEEP_THRESHOLD = 60         # Native auto-sleep on Telegram flood waits < 60s
