@@ -167,9 +167,19 @@ async def download_worker(client, message, target_file, clean_filename, current_
 
         for attempt in range(1, RETRY_ATTEMPTS + 1):
             try:
+                # Proactively refresh stale message references on retry
+                if attempt > 1:
+                    try:
+                        fresh = await client.get_messages(entity, ids=int(msg_id))
+                        if fresh and fresh.media:
+                            message = fresh
+                    except Exception:
+                        pass
+
                 if file_size >= large_file_bytes and message.media:
+                    # Pass the full message object to allow automatic file_reference refresh
                     success = await download_file_parallel(
-                        client, message.media, target_file, file_size, progress_callback=progress_callback
+                        client, message, target_file, file_size, progress_callback=progress_callback
                     )
                 else:
                     await client.download_media(message, file=str(target_file), progress_callback=progress_callback)
@@ -192,6 +202,15 @@ async def download_worker(client, message, target_file, clean_filename, current_
                 progress.update(task_id, filename=f"[yellow]{'Paused (RateLimit)':<25}[/yellow]")
                 await asyncio.sleep(e.seconds + 2)
                 progress.update(task_id, filename=disp_name)
+            except (errors.FileReferenceExpiredError, errors.FilerefUpgradeNeededError):
+                progress.console.print(f"[yellow]🔄 File reference expired for {disp_name.strip()}, refreshing from Telegram...[/yellow]")
+                try:
+                    fresh = await client.get_messages(entity, ids=int(msg_id))
+                    if fresh and fresh.media:
+                        message = fresh
+                except Exception:
+                    pass
+                await asyncio.sleep(1)
             except Exception as e:
                 # SAFE PRINT: Does not corrupt the progress buffer
                 progress.console.print(f"[red]Worker {slot_id} Error on {disp_name.strip()}: {e}[/red]")

@@ -1,4 +1,4 @@
-# fast_telethon.py - High-Performance Parallel MTProto Chunk Downloader
+# fast_telethon.py - High-Performance Parallel MTProto Chunk Downloader with Auto-Refresh
 import os
 import math
 import asyncio
@@ -7,7 +7,7 @@ import logging
 from pathlib import Path
 from typing import Optional, List, Union
 
-from telethon import utils, TelegramClient
+from telethon import utils, errors, TelegramClient
 from telethon.network import MTProtoSender
 from telethon.tl.alltlobjects import LAYER
 from telethon.tl.functions import InvokeWithLayerRequest
@@ -96,12 +96,15 @@ class ParallelTransferrer:
 
         part = 0
         while part < part_count:
-            tasks = [asyncio.create_task(s.next()) for s in self.senders]
-            for task in tasks:
-                data = await task
-                if not data:
+            # Safely gather without leaving un-retrieved task exceptions
+            tasks = [s.next() for s in self.senders]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for res in results:
+                if isinstance(res, Exception):
+                    raise res
+                if not res:
                     break
-                yield data
+                yield res
                 part += 1
 
         await self._cleanup()
@@ -114,15 +117,17 @@ async def download_file_parallel(
     progress_callback=None,
     connections: int = None
 ) -> bool:
-    """High-speed parallel MTProto chunk streaming directly to disk."""
+    """High-speed parallel MTProto chunk streaming with automatic file_reference renewal."""
     connections = connections or PARALLEL_CHUNKS_PER_FILE or 4
     out_path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = out_path.with_suffix(out_path.suffix + ".tmp")
 
+    # If a Message object is passed, extract media
+    media_obj = getattr(location, 'media', location)
+
     try:
-        dc_id, input_location = utils.get_input_location(location)
+        dc_id, input_location = utils.get_input_location(media_obj)
     except Exception:
-        # Fallback to standard client download if location can't be resolved
         try:
             await client.download_media(location, file=str(out_path), progress_callback=progress_callback)
             return True
@@ -151,6 +156,22 @@ async def download_file_parallel(
             if temp_path.exists():
                 temp_path.unlink()
             return False
+
+    except (errors.FileReferenceExpiredError, errors.FilerefUpgradeNeededError):
+        await downloader._cleanup()
+        # Re-fetch fresh message from Telegram when file_reference expires
+        if hasattr(location, 'id'):
+            try:
+                chat_id = getattr(location, 'chat_id', None) or getattr(location, 'peer_id', None)
+                fresh = await client.get_messages(chat_id, ids=location.id)
+                if fresh and fresh.media:
+                    return await download_file_parallel(
+                        client, fresh, out_path, file_size, progress_callback=progress_callback, connections=connections
+                    )
+            except Exception:
+                pass
+        return False
+
     except Exception as e:
         await downloader._cleanup()
         # Fallback to standard download
